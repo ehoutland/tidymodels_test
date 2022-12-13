@@ -1,0 +1,260 @@
+---
+title: "Ames housing with tidymodels"
+output: html_document
+date: "2022-12-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Ames housing with `tidymodels`
+
+## Loading required packages
+
+```{r}
+library(data.table)
+library(tidymodels)
+library(AmesHousing)
+theme_set(theme_bw())
+```
+
+## Loading in initial data
+
+```{r}
+#loading initial data, transforming some features
+ames = data.table(ames)
+setnames(ames, tolower(names(ames)))
+ames[, sale_price := log10(sale_price)]
+
+#convert character columns to factor
+charCols = names(Filter(is.character, ames))
+ames[, (charCols) := lapply(.SD, as.factor), .SDcols = charCols]
+
+#view data columns and their classes
+glimpse(ames)
+
+##view distribution of variable of interest
+ggplot(ames) +
+  geom_density(aes(x = sale_price)) +
+  labs(x = 'Sale price', y = 'Density')
+```
+
+## Building models with `parsnip`
+
+Specifying and training and initial model on housing data.
+
+```{r}
+#specifying a linear model with the default engine
+lmSpec = linear_reg()
+
+#training the model on housing data
+lmFit = fit(lmSpec, sale_price ~ latitude + longitude, data = ames)
+lmFit
+```
+
+We can use `tidy()` to get a standardized model summary table.
+
+```{r}
+data.table(tidy(lmFit))
+```
+
+As with base R, we can make predictions using the trained model.
+
+```{r}
+set.seed(123)
+
+newHomes = data.table(
+  latitude = sample(ames$latitude, 5), longitude = sample(ames$longitude, 5))
+
+predict(lmFit, new_data = newHomes)
+```
+What if we want to use a different model (e.g., a random forest model powered by `ranger`)? We can use `setengine` to specify.
+
+```{r}
+#specifying a regression tree model with rpart as the computational engine
+rfSpec = rand_forest()
+rfSpec = set_engine(rfSpec, engine = 'ranger') #also could use randomForest
+rfSpec = set_mode(rfSpec, mode = 'regression') #since random forest can classify, too
+
+#training the model on housing data
+rfFit = fit(rfSpec, sale_price ~ latitude + longitude, data = ames)
+rfFit
+
+data.table(predict(rfFit, new_data = newHomes))
+```
+
+## Splitting the data with `rsample`
+
+Typically, you don't want to train a model on the whole dataset. How can `tidymodels` help? Introducing `rsample`.
+
+```{r}
+set.seed(123)
+
+#split ames data, holding out 25% of data for testing
+amesSplit = initial_split(ames, prop = 3/4)
+
+#extracting training split
+amesTrain = training(amesSplit)
+
+#extracting testing split
+amesTest = testing(amesSplit)
+```
+
+## Training and test a model with training and testing data, evaluate rmse
+
+```{r}
+#fitting a model on training daata
+rfFit = fit(rfSpec, sale_price ~ longitude + latitude, data = amesTrain)
+
+#making predictions on test data, saving true value
+pricePred = data.table(predict(rfFit, new_data = amesTest))
+pricePred = cbind(pricePred, sale_price = amesTest$sale_price)
+
+#checking rmse (from yardstick)
+rmse(pricePred, truth = sale_price, estimate = .pred)
+
+ggplot(pricePred) +
+  geom_point(aes(x = sale_price, y = .pred), alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0)
+```
+## Cross-validation with `rsample`
+
+You can perform more complex sampling schemes than just splitting the data into a training and test set. For example, 10-fold cross-validation with samples stratified by price.
+
+```{r}
+set.seed(123)
+
+cvFolds = vfold_cv(amesTrain, v = 10, strata = sale_price, breaks = 4)
+cvFolds
+```
+
+`rsample` also provides tools for training and testing on resampled data, namely `fit_resamples`.
+
+```{r}
+#train and test model on each fold
+fitResamps = fit_resamples(rfSpec, sale_price ~ latitude + longitude, resamples = cvFolds)
+
+#view summary of metrics across folds
+metricsSum = collect_metrics(fitResamps)
+metricsSum
+```
+
+## Using `recipes`
+
+You can use recipes to preprocess the data. First, set up a recipe.
+
+```{r}
+#specify the recipe as a formula
+rec = recipe(
+  sale_price ~ longitude + latitude + neighborhood + central_air + year_built,
+  data = amesTrain)
+#set factor levels that occur in less than 5% of data as other
+rec = step_other(rec, neighborhood, threshold = 0.05)
+#create dumy variables for all factor variables
+rec = step_dummy(rec, all_nominal())
+#add an interaction term 
+rec = step_interact(rec, ~ starts_with('central_air'):year_built)
+#view recipe and operations
+rec
+```
+
+Then, "train" the recipe.
+
+```{r}
+amesRec = prep(rec, amesTrain, verbose = TRUE)
+amesRec
+```
+
+Now you can apply it to new data using `bake()`.
+
+```{r}
+amesRecNew = bake(amesRec, amesTest)
+data.table(amesRecNew)
+```
+
+## Tuning models with `tune`
+
+An important part of preparing a machine learning model is tuning the hyperparameters to maximize predictive accuracy (however you might measure it). The `tune` package in `tidymodels` provides utilities to assist in this.
+
+There are several tuning strategies that you can pursue. Below, we'll demonstrate grid search.
+
+First, specify the hyperparameters that you're tuning.
+
+```{r}
+ctrl = control_grid(save_pred = TRUE)
+
+#use tune() as a placeholder argument for parameters that you want to tune
+rfSpec = rand_forest(mtry = tune())
+rfSpec = set_mode(rfSpec, 'regression')
+rfSpec = set_engine(rfSpec, 'ranger', regularization.factor = tune())
+
+#show tuning parameters
+rfParams = parameters(rfSpec)
+rfParams
+```
+Now, we perform cross validation and grid search.
+
+```{r}
+set.seed(123)
+
+folds = vfold_cv(data = bake(amesRec, new_data = NULL))
+
+rfTune = tune_grid(rfSpec, sale_price ~ ., resamples = folds, grid = 10, control = ctrl)
+rfTune
+
+#check results
+autoplot(rfTune, metric = 'rmse')
+```
+
+Now that we have a table of cv results, we can train the optimal model.
+
+```{r}
+#select the best model by rmse
+bestRes = select_best(rfTune, metric = 'rmse')
+
+rfSpecFinal = rand_forest(mtry = bestRes$mtry)
+rfSpecFinal = set_mode(rfSpecFinal, 'regression')
+rfSpecFinal = set_engine(
+  rfSpecFinal, 'ranger', regularization.factor = bestRes$regularization.factor)
+
+#training 'best' model
+rfFitFinal = fit(rfSpecFinal, sale_price ~ ., data = bake(amesRec, new_data = NULL))
+```
+
+Then, we can apply it to new data (preprocessed based on the recipe from earlier).
+
+```{r}
+predFinal = data.table(predict(rfFitFinal, bake(amesRec, new_data = amesTest)))
+predFinal = cbind(predFinal, amesTest)
+
+rmse(predFinal, sale_price, .pred)
+
+ggplot(predFinal) +
+  geom_point(aes(x = sale_price, y = .pred), alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0)
+```
+
+## Building `workflows`
+
+We can simplify some of what we did above using workflows. For example, if we want to combine preprocessing and fitting a model, we can do:
+
+```{r}
+amesWf = workflow()
+amesWf = add_recipe(amesWf, amesRec)
+amesWf = add_model(amesWf, rfSpecFinal)
+amesWf = fit(amesWf, data = amesTrain)
+#view the workflow
+amesWf
+
+#use the workflow to predict
+predWf = data.table(predict(amesWf, new_data = amesTest))
+
+predWf = cbind(predWf, amesTest)
+
+rmse(predWf, sale_price, .pred)
+
+ggplot(predWf) +
+  geom_point(aes(x = sale_price, y = .pred), alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0)
+```
